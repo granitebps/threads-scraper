@@ -7,26 +7,32 @@ What logged-out Threads serves (probed 2026-09-21):
     about this topic". No cursor exists to expose.
   * user search: up to 50 accounts in one call (first=50 honoured), no
     further pages.
-  * tag pages (/tag/<hashtag>): 20 threads plus the tag's total and recent
-    thread counts in the page's og:title / og:description ("python · 2.4M
-    threads", "9.3K recent threads · …"). Topic chips (tags with an id,
-    e.g. "AI Threads") open /search?q=<name>&serp_type=tags&tag_id=<id>,
-    which carries no counts. An unknown tag renders an empty page (no 404).
+  * tag feeds: the tag search surface (search_surface="tags", ~20
+    threads); the tag's total and recent thread counts only exist in the
+    /tag/<hashtag> page's og:title / og:description ("python · 2.4M threads",
+    "9.3K recent threads · …") — that page's own thread list is an unrelated
+    recent stream and is not used. Topic chips (tags with an id, e.g. "AI
+    Threads") have no counts. An unknown tag returns no threads (no 404).
   * home feed: the "For you" feed the site shows logged-out visitors,
     localised by `specified_country`, ~12 threads then ~10 more, cursor
     paged until has_next_page is false.
 """
 import re
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from . import parsers as P
 from . import refs
-from .fetch import ThreadsBadRequest, ThreadsExecutionError, graphql
+from .fetch import ThreadsBadRequest, ThreadsExecutionError, graphql, run_parallel
 from .ssr import load, og_meta
 from .users import INVALID_CURSOR
 
+# search_surface is lower case, exactly as the web app sends it: "default"
+# for post search, "tags" for a tag / topic feed. The upper-case "DEFAULT"
+# (or null) is NOT rejected — it silently returns an unrelated stream of
+# recent posts with only a few keyword hits (found 2026-09-21: "SpaceX" top
+# results were Taiwanese stock tips). `recent` is an int 0/1, not a bool.
 _SEARCH_DEFAULTS = dict(
-    search_surface="DEFAULT", after=None, before=None, first=25, last=None, meta_place_id=None,
+    after=None, before=None, first=25, last=None, meta_place_id=None,
     pinned_ids=None, power_search_info=None, tagID=None, trend_fbid=None, has_communities=False,
     has_community_green_dot=False, has_favicons=False, has_live_chats=False, has_serp_header=False,
 )
@@ -36,15 +42,15 @@ _SCALE = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 def search_posts(query, sort="top"):
     """Threads matching the query, as the site's search shows them."""
-    data = graphql("BarcelonaSearchResultsRefetchableQuery", query=query,
-                   recent=True if sort == "recent" else None, **_SEARCH_DEFAULTS)
+    data = graphql("BarcelonaSearchResultsRefetchableQuery", query=query, search_surface="default",
+                   recent=1 if sort == "recent" else 0, **_SEARCH_DEFAULTS)
     threads = P.threads_list((data.get("searchResults") or {}).get("edges"))
     return {"query": query, "sort": sort, "thread_count": len(threads), "threads": threads}
 
 
 def search_users(query, limit=20):
     """Accounts matching the query (username, name)."""
-    data = graphql("BarcelonaSearchUserResultsQuery", query=query, search_surface="DEFAULT",
+    data = graphql("BarcelonaSearchUserResultsQuery", query=query, search_surface="default",
                    after=None, before=None, first=limit, last=None)
     users = []
     for edge in (data.get("searchResults") or {}).get("edges") or []:
@@ -80,18 +86,27 @@ def tag_counts(og):
 
 
 def search_tag(tag):
-    """Threads under a hashtag or topic, with the tag's thread counts."""
+    """Threads under a hashtag or topic, with the tag's thread counts.
+
+    The threads come from the tag search surface (the site's
+    /search?serp_type=tags results); the /tag/<name> page is read only for
+    its og counts — its own preloaded list is an unrelated stream of recent
+    posts, not the tag's threads."""
     name, tag_id = tag["name"], tag.get("id")
-    if tag_id:
-        path = "/search?" + urlencode({"q": name, "serp_type": "tags", "tag_id": tag_id})
-    elif " " in name:
-        path = "/search?" + urlencode({"q": name, "serp_type": "tags"})
-    else:
-        path = "/tag/" + quote(name, safe="")
-    data, html = load(path, label=f"tag {name}", required="BarcelonaSearchResultsQuery")
-    results = (data.get("BarcelonaSearchResultsQuery") or {}).get("searchResults") or {}
-    threads = P.threads_list(results.get("edges"))
-    total, recent = tag_counts(og_meta(html)) if path.startswith("/tag/") else (None, None)
+
+    def threads_call():
+        variables = dict(_SEARCH_DEFAULTS, tagID=tag_id)
+        return graphql("BarcelonaSearchResultsRefetchableQuery", query=name, search_surface="tags", recent=0,
+                       **variables)
+
+    def counts_call():
+        if tag_id or " " in name:          # topic chips: no /tag/ page with counts
+            return None, None
+        _, html = load("/tag/" + quote(name, safe=""), label=f"tag {name}", required="BarcelonaSearchResultsQuery")
+        return tag_counts(og_meta(html))
+
+    data, (total, recent) = run_parallel([threads_call, counts_call])
+    threads = P.threads_list((data.get("searchResults") or {}).get("edges"))
     return {
         "tag": {
             "id": tag_id,

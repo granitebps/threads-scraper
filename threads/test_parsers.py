@@ -296,3 +296,24 @@ def test_malformed_edges_are_skipped():
     assert P.threads_list([None, 1, {}, {"node": {"thread_items": [{"post": None}]}}]) == []
     assert P.page_info(None) == (None, False)
     assert P.page_info({"page_info": {"has_next_page": True, "end_cursor": ""}}) == (None, False)
+
+
+# ---- search variables (regression: upper-case surface = unrelated results) -----------
+
+def test_search_sends_lowercase_surfaces_and_int_recent(monkeypatch):
+    calls = []
+
+    def fake_graphql(name, **variables):
+        calls.append((name, variables))
+        return {"searchResults": {"edges": []}}
+
+    monkeypatch.setattr(discovery, "graphql", fake_graphql)
+    monkeypatch.setattr(discovery, "load", lambda *a, **k: ({}, '<meta property="og:title" content="ai · 1.2M threads" />'))
+    discovery.search_posts("SpaceX")
+    discovery.search_posts("SpaceX", sort="recent")
+    discovery.search_users("nasa", 5)
+    out = discovery.search_tag({"name": "ai", "id": None})
+    surfaces = [(name.replace("Barcelona", ""), v["search_surface"], v.get("recent")) for name, v in calls]
+    assert surfaces == [("SearchResultsRefetchableQuery", "default", 0), ("SearchResultsRefetchableQuery", "default", 1),
+                        ("SearchUserResultsQuery", "default", None), ("SearchResultsRefetchableQuery", "tags", 0)]
+    assert out["tag"]["thread_count"] == 1_200_000
