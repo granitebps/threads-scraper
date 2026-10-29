@@ -47,7 +47,15 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   ThreadsBlocked        403 / 429 / HTML instead of JSON          — retryable
   ThreadsBadRequest     upstream 400                              — never retried
   ThreadsNotFound       unknown user / post / tag                 — never retried
+  ThreadsTimeout        the caller's deadline() ran out           — not retried here
+
+DEADLINE: `with deadline(seconds):` bounds every request, retry and backoff
+made inside the block (including run_parallel fan-out) to one total budget.
+Without it the nested retries (ssr.load x _retrying x timeouts) can run for
+minutes; the MCP server sets one per tool call. Unset = no bound, so the
+REST API and main.py behave as before.
 """
+import contextvars
 import json
 import os
 import secrets
@@ -56,6 +64,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,6 +116,39 @@ class ThreadsBadRequest(BadRequest):
 
 class ThreadsNotFound(NotFound):
     """The user / post / tag does not exist — never retried."""
+
+
+class ThreadsTimeout(ThreadsUpstreamError):
+    """The deadline() budget ran out before Threads answered."""
+
+
+# ---- deadline --------------------------------------------------------------------
+_deadline = contextvars.ContextVar("threads_deadline", default=None)
+
+
+@contextmanager
+def deadline(seconds):
+    """Bound everything fetched inside the block to `seconds` in total."""
+    token = _deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+def _remaining():
+    end = _deadline.get()
+    return None if end is None else end - time.monotonic()
+
+
+def _timeout(default):
+    """The request timeout to use: `default`, cut to what the deadline leaves."""
+    left = _remaining()
+    if left is None:
+        return default
+    if left <= 0:
+        raise ThreadsTimeout("ran out of time waiting for threads.com")
+    return min(default, left)
 
 
 # ---- sessions --------------------------------------------------------------------
@@ -176,6 +218,8 @@ def _retrying(fn, no_retry=()):
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
             return fn()
+        except ThreadsTimeout:
+            raise
         except no_retry:
             raise
         except ThreadsBlocked as e:
@@ -185,7 +229,11 @@ def _retrying(fn, no_retry=()):
             last = e
             _drop_session()
         if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
+            pause = config.RETRY_BACKOFF * attempt
+            left = _remaining()
+            if left is not None and left <= pause:
+                raise ThreadsTimeout(f"ran out of time retrying threads.com (last error: {last})")
+            time.sleep(pause)
     raise last
 
 
@@ -240,8 +288,9 @@ def graphql(name, retry_execution_errors=True, **variables):
         }
         if query.get("root"):
             headers["x-root-field-name"] = query["root"]
+        timeout = _timeout(GRAPHQL_TIMEOUT)
         try:
-            resp = sess.post(GRAPHQL_URL, data=body, headers=headers, timeout=GRAPHQL_TIMEOUT)
+            resp = sess.post(GRAPHQL_URL, data=body, headers=headers, timeout=timeout)
         except Exception as e:
             raise ThreadsUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -284,8 +333,9 @@ def get_page(path, *, label):
 
     def once():
         sess = _session()
+        timeout = _timeout(PAGE_TIMEOUT)
         try:
-            resp = sess.get(url, headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT, allow_redirects=True)
+            resp = sess.get(url, headers=PAGE_HEADERS, timeout=timeout, allow_redirects=True)
         except Exception as e:
             raise ThreadsUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -317,13 +367,14 @@ def get_page(path, *, label):
 
 def run_parallel(fns):
     """Run zero-arg callables in parallel; results align with `fns`.
-    Exceptions propagate from the first failing call."""
+    Exceptions propagate from the first failing call. Each call runs in a
+    copy of the caller's context so a deadline() reaches the workers."""
     if not fns:
         return []
     if len(fns) == 1:
         return [fns[0]()]
     with ThreadPoolExecutor(max_workers=min(FANOUT_WORKERS, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
+        futures = [ex.submit(contextvars.copy_context().run, fn) for fn in fns]
         return [f.result() for f in futures]
 
 
